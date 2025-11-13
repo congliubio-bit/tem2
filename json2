@@ -24,3 +24,76 @@ print("STATUS:", r.status_code)
 print("BODY:\n", (r.text or "")[:1000])
 r.raise_for_status()
 out = r.json()
+
+
+### 
+import os, json, requests, pandas as pd, matplotlib.pyplot as plt
+
+def run_survival_model(row: dict, url: str, token: str) -> dict:
+    """
+    Call the Databricks Survival Model endpoint.
+    Returns a dictionary containing both scalars and the survival table.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"dataframe_records": [row]}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    out = r.json()
+
+    # Extract predictions section
+    pred = out.get("predictions", {})
+
+    # Scalars (flatten all non-table values)
+    scalars = {k: v for k, v in pred.items() if not isinstance(v, list)}
+
+    # Survival curve table
+    surv_probs = pred.get("surv_probs", [])
+    surv_df = pd.DataFrame(surv_probs).rename(columns={".time": "time", ".pred_survival": "S"})
+
+    # Plot survival curve
+    plt.figure(figsize=(6,4))
+    plt.step(surv_df["time"], surv_df["S"], where="post")
+    plt.ylim(0, 1.05)
+    plt.xlabel("Time (years)")
+    plt.ylabel("Survival Probability S(t)")
+    plt.title("Survival Curve")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+    return {"scalars": scalars, "surv_df": surv_df}
+
+###
+MODEL_URL = os.environ["DBX_SURVIVAL_URL"]
+TOKEN     = os.environ["DATABRICKS_TOKEN"]
+
+row = {
+    "marg_probs": {"age": 0.4, "biomarker": 0.5, "time_diag": 0.4},
+    "init_prob": 0.8,
+    "beta": {"age": 0.05, "biomarker": 0.08, "time_diag": 0.06},
+    "intercepts": [-2.64, -9.89],
+    "kappa": [0.44, 0.068],
+    "tau": 8.30,
+    "t0": 1.0,
+    "surv_treat_at_t0": 0.5,
+    "trial_dur": 2.0
+}
+
+results = run_survival_model(row, MODEL_URL, TOKEN)
+scalars = results["scalars"]
+surv_df = results["surv_df"]
+
+print("\n📊 Scalar outputs:")
+for k, v in scalars.items():
+    print(f"{k:30s}: {v}")
+
+
+###
+# Save the survival table
+surv_df.to_csv("survival_curve.csv", index=False)
+
+# Append scalar results into a tracking DataFrame for multiple runs
+df_runs = pd.DataFrame([scalars])
+df_runs.to_csv("survival_summaries.csv", index=False)
+
