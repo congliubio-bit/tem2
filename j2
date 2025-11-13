@@ -1,0 +1,239 @@
+#1
+import os, json, time, math, requests
+from typing import Any, Dict, List, TypedDict
+
+# --- Workspace auth (use env vars or inject in the notebook) ---
+DATABRICKS_HOST  = os.environ["DATABRICKS_HOST"].rstrip("/")
+DATABRICKS_TOKEN = os.environ["DATABRICKS_TOKEN"]
+
+# --- Serving endpoint names (EDIT THESE) ---
+SURVIVAL_EP   = "survival-model-endpoint"
+POWER_EP      = "power-model-endpoint"
+RECRUIT_EP    = "recruitment-model-endpoint"
+
+# --- Robust HTTP caller with retries/backoff ---
+session = requests.Session()
+session.headers.update({
+    "Authorization": f"Bearer {DATABRICKS_TOKEN}",
+    "Content-Type":  "application/json",
+})
+DEFAULT_TIMEOUT = 45
+MAX_RETRIES     = 4
+BACKOFF_BASE_S  = 0.6
+
+def call_endpoint(endpoint: str, payload: Dict[str, Any], timeout=DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    url = f"{DATABRICKS_HOST}/serving-endpoints/{endpoint}/invocations"
+    body = json.dumps(payload)
+    for i in range(MAX_RETRIES + 1):
+        r = session.post(url, data=body, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        # retry on transient codes
+        if r.status_code in (429, 500, 502, 503, 504) and i < MAX_RETRIES:
+            time.sleep(BACKOFF_BASE_S * (2 ** i))
+            continue
+        raise RuntimeError(f"{endpoint} -> {r.status_code}: {r.text[:1000]}")
+
+
+#2
+import pandas as pd
+
+def payload_survival(user_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    user_params should contain:
+      marg_probs (dict), beta (dict), intercepts (list[float]), kappa (list[float]),
+      init_prob (float), tau (float), t0 (float), surv_treat_at_t0 (float), trial_dur (float)
+    """
+    # ensure pure-Python primitives (no numpy / NaN)
+    def _py(v):
+        if hasattr(v, "item"): return v.item()
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)): raise ValueError("NaN/Inf")
+        if isinstance(v, list):  return [_py(x) for x in v]
+        if isinstance(v, dict):  return {str(k): _py(x) for k, x in v.items()}
+        return v
+    row = _py(user_params)
+    return {"dataframe_records": [row]}
+
+def parse_survival(resp: Dict[str, Any]) -> Dict[str, Any]:
+    pred = resp["predictions"]
+    # survival table
+    surv_df = pd.DataFrame(pred["surv_probs"]).rename(columns={".time":"time",".pred_survival":"S"})
+    # scalars we’ll pass downstream
+    scalars = {
+        "median_survival_time_quantile": pred.get("median_survival_time_quantile"),
+        "median_survival_time":         pred.get("median_survival_time"),
+        "surv_contr_at_t0":             pred.get("surv_contr_at_t0"),
+        "pev_contr_at_final":           pred.get("pev_contr_at_final"),
+        "HR":                            pred.get("HR"),
+        "total_n_at_90_pos":            pred.get("total_n_at_90_pos"),
+        "comp_time":                    pred.get("comp_time"),
+    }
+    return {"surv_df": surv_df, "surv_scalars": scalars}
+
+#3
+def payload_power(N_list: List[int], HR: float, pev: float) -> Dict[str, Any]:
+    return {"inputs": {"N": [int(n) for n in N_list], "HR": float(HR), "pev": float(pev)}}
+
+def parse_power(resp: Dict[str, Any]) -> pd.DataFrame:
+    # aligns with N_list order we sent; we’ll join later if needed
+    preds = resp["predictions"]
+    return pd.DataFrame({"power": preds})
+
+#4
+def payload_recruit(n_total: int, countries: List[str], n_sites: int) -> Dict[str, Any]:
+    return {"inputs": {"N_total": int(n_total), "countries": list(countries), "n_sites": int(n_sites)}}
+
+def parse_recruit(resp: Dict[str, Any]) -> pd.DataFrame:
+    proj = resp.get("projection") or resp.get("recruitment") or []
+    return pd.DataFrame(proj)  # expect columns like ["day","enrolled_cum"]
+
+#5
+from langgraph.graph import StateGraph, END
+
+class PipeState(TypedDict, total=False):
+    # user inputs
+    survival_params: Dict[str, Any]      # all survival knobs
+    recruit_countries: List[str]
+    recruit_n_sites: int
+
+    # survival outputs
+    surv_df: pd.DataFrame
+    surv_scalars: Dict[str, Any]
+
+    # power inputs/outputs
+    power_N: List[int]
+    power_df: pd.DataFrame
+
+    # recruitment outputs
+    recruit_df: pd.DataFrame
+
+    # final summary
+    summary: Dict[str, Any]
+
+def survival_node(state: PipeState) -> PipeState:
+    resp = call_endpoint(SURVIVAL_EP, payload_survival(state["survival_params"]))
+    out  = parse_survival(resp)
+    return {**state, **out}
+
+def power_node(state: PipeState) -> PipeState:
+    # pull from survival scalars
+    n_float = state["surv_scalars"]["total_n_at_90_pos"]
+    HR      = state["surv_scalars"]["HR"]
+    pev     = state["surv_scalars"]["pev_contr_at_final"]
+
+    # round N to an int; send as a list (API expects list)
+    n_int = int(math.ceil(float(n_float)))
+    N_list = [n_int] if not state.get("power_N") else state["power_N"]  # allow override
+
+    resp = call_endpoint(POWER_EP, payload_power(N_list, HR, pev))
+    pdf  = parse_power(resp).assign(N=N_list)  # add N column so rows align
+    return {**state, "power_df": pdf, "power_N": N_list}
+
+def recruit_node(state: PipeState) -> PipeState:
+    n_float = state["surv_scalars"]["total_n_at_90_pos"]
+    n_total = int(math.ceil(float(n_float)))
+    countries = state["recruit_countries"]
+    n_sites   = state["recruit_n_sites"]
+
+    resp = call_endpoint(RECRUIT_EP, payload_recruit(n_total, countries, n_sites))
+    rdf  = parse_recruit(resp)
+    return {**state, "recruit_df": rdf}
+
+def gather_node(state: PipeState) -> PipeState:
+    # small summary dict you can print/log
+    s = state["surv_scalars"]
+    summary = {
+        "N_total_90pos": int(math.ceil(float(s["total_n_at_90_pos"]))),
+        "HR":            float(s["HR"]),
+        "pev_final":     float(s["pev_contr_at_final"]),
+        "median_surv":   s.get("median_survival_time"),
+        "power_rows":    len(state["power_df"]) if "power_df" in state else 0,
+        "recruit_rows":  len(state["recruit_df"]) if "recruit_df" in state else 0,
+    }
+    return {**state, "summary": summary}
+
+def build_graph():
+    g = StateGraph(PipeState)
+    g.add_node("survival", survival_node)
+    g.add_node("power",    power_node)
+    g.add_node("recruit",  recruit_node)
+    g.add_node("gather",   gather_node)
+
+    g.set_entry_point("survival")
+    # survival fans out to power + recruit
+    g.add_edge("survival", "power")
+    g.add_edge("survival", "recruit")
+    # both converge to gather
+    g.add_edge("power",   "gather")
+    g.add_edge("recruit", "gather")
+    g.add_edge("gather", END)
+    return g.compile()
+
+#6
+app = build_graph()
+
+# --- user-defined survival parameters (edit as needed) ---
+surv_params = {
+    "marg_probs": {"age": 0.4, "biomarker": 0.5, "time_diag": 0.4},
+    "init_prob": 0.8,
+    "beta": {"age": 0.05, "biomarker": 0.08, "time_diag": 0.06},
+    "intercepts": [-2.64, -9.89],
+    "kappa": [0.44, 0.068],
+    "tau": 8.30,
+    "t0": 1.0,
+    "surv_treat_at_t0": 0.5,
+    "trial_dur": 2.0
+}
+
+# --- user-defined recruitment extras ---
+countries = ["US", "CA", "GB"]   # example
+n_sites   = 35                    # example
+
+final = app.invoke({
+    "survival_params": surv_params,
+    "recruit_countries": countries,
+    "recruit_n_sites": n_sites,
+    # Optional: override power_N to sweep around suggested N, e.g., [n-100, n, n+100]
+    # "power_N": [500, 600, 700]
+})
+
+print("Summary:", final["summary"])
+final["surv_df"].head(), final["power_df"].head(), final["recruit_df"].head()
+
+#7
+import matplotlib.pyplot as plt
+
+# Survival curve
+plt.figure()
+plt.step(final["surv_df"]["time"], final["surv_df"]["S"], where="post")
+plt.ylim(0, 1.05)
+plt.xlabel("Time (years)")
+plt.ylabel("Survival S(t)")
+plt.title("Survival (from Serving)")
+plt.tight_layout()
+plt.show()
+
+# Power vs N (if you supplied multiple Ns)
+if len(final["power_df"]) > 1:
+    pdf = final["power_df"].sort_values("N")
+    plt.figure()
+    plt.plot(pdf["N"], pdf["power"], marker="o")
+    plt.ylim(0, 1.05)
+    plt.xlabel("Sample size (N)")
+    plt.ylabel("Power")
+    plt.title("Power vs N")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+# Recruitment projection (if returned with day/enrolled_cum)
+rdf = final["recruit_df"]
+if {"day","enrolled_cum"}.issubset(rdf.columns):
+    plt.figure()
+    plt.step(rdf["day"], rdf["enrolled_cum"], where="post")
+    plt.xlabel("Day")
+    plt.ylabel("Cumulative enrolled")
+    plt.title("Recruitment Projection")
+    plt.tight_layout()
+    plt.show()
+
