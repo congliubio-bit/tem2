@@ -1,0 +1,41 @@
+import requests, os
+
+MODEL_URL = os.environ["DBX_SURVIVAL_URL"]
+TOKEN     = os.environ["DATABRICKS_TOKEN"]
+headers   = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+base = {
+  "marg_probs": {"age": 0.4, "biomarker": 0.5, "time_diag": 0.4},
+  "init_prob": 0.8,
+  "beta": {"age": 0.05, "biomarker": 0.08, "time_diag": 0.06},
+  "intercepts": [-2.64, -9.89],
+  "kappa": [0.44, 0.068],
+  "tau": 8.30,
+  "t0": 1,
+  "surv_treat_at_t0": 0.5,
+  "trial_dur": 2
+}
+
+candidates = [
+    {"inputs": base},                     # custom handlers often expect this
+    {"instances": [base]},                # TF-style / some handlers
+    {"dataframe_records": [base]},        # MLflow pyfunc tabular
+    {"dataframe_split": {                 # MLflow pyfunc (split orientation)
+        "columns": list(base.keys()),
+        "data": [[
+            base["marg_probs"], base["init_prob"], base["beta"],
+            base["intercepts"], base["kappa"], base["tau"],
+            base["t0"], base["surv_treat_at_t0"], base["trial_dur"]
+        ]]
+    }},
+]
+
+for i, payload in enumerate(candidates, 1):
+    r = requests.post(MODEL_URL, headers=headers, json=payload, timeout=30)
+    print(f"Try {i}: {list(payload.keys())[0]} -> {r.status_code}")
+    if r.ok:
+        out = r.json()
+        print("Success with key:", list(payload.keys())[0])
+        break
+    else:
+        print(r.text[:500])
