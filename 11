@@ -1,29 +1,26 @@
-import os, json, requests
+import os, requests
 
-MODEL_URL = os.environ["DBX_SURVIVAL_URL"]  # full .../serving-endpoints/<name>/invocations
+MODEL_URL = os.environ["DBX_SURVIVAL_URL"]
 TOKEN     = os.environ["DATABRICKS_TOKEN"]
 headers   = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-row = {
-    # these FOUR must be STRINGS (JSON-encoded!)
-    "marg_probs": json.dumps({"age": 0.4, "biomarker": 0.5, "time_diag": 0.4}),
-    "beta":       json.dumps({"age": 0.05, "biomarker": 0.08, "time_diag": 0.06}),
-    "intercepts": json.dumps([-2.64, -9.89]),
-    "kappa":      json.dumps([0.44, 0.068]),
-
-    # numeric fields
-    "init_prob":        0.8,
-    "tau":              8.30,
-    "t0":               1.0,
-    "surv_treat_at_t0": 0.5,   # ensure ZERO, not letter 'O'
-    "trial_dur":        2.0
+# Build payload with NATIVE Python types ONLY:
+base = {
+    "marg_probs": {"age": 0.4, "biomarker": 0.5, "time_diag": 0.4},  # dict
+    "init_prob": 0.8,                                                # float
+    "beta": {"age": 0.05, "biomarker": 0.08, "time_diag": 0.06},     # dict
+    "intercepts": [-2.64, -9.89],                                    # list[float]
+    "kappa": [0.44, 0.068],                                          # list[float]
+    "tau": 8.30,                                                     # float
+    "t0": 1.0,                                                       # float
+    "surv_treat_at_t0": 0.5,                                         # float  (zero, not letter O)
+    "trial_dur": 2.0                                                 # float
 }
 
-payload = {"dataframe_records": [row]}
+payload = {"dataframe_records": [base]}
 
 r = requests.post(MODEL_URL, headers=headers, json=payload, timeout=30)
 print("STATUS:", r.status_code)
-print("BODY:", (r.text or "")[:800])
+print("BODY:\n", (r.text or "")[:1000])
 r.raise_for_status()
-
 out = r.json()
