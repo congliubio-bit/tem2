@@ -1,0 +1,50 @@
+import os, requests, json
+import pandas as pd
+import matplotlib.pyplot as plt
+
+POWER_URL = os.environ.get("DBX_POWER_URL") or "https://<host>/serving-endpoints/<power-endpoint>/invocations"
+TOKEN     = os.environ["DATABRICKS_TOKEN"]
+
+def call_power_model_inputs(url: str, token: str, N, HR: float, pev: float, timeout_s: int = 30):
+    """
+    Call the Databricks Power endpoint that expects:
+      { "inputs": { "N": [ints], "HR": float, "pev": float } }
+    Returns dict with 'predictions' (list of power values).
+    """
+    # enforce pure-Python types & simple validation
+    N_py = [int(n) for n in list(N)]
+    payload = {"inputs": {"N": N_py, "HR": float(HR), "pev": float(pev)}}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+    r.raise_for_status()
+    return r.json()
+
+def to_power_df(N, predictions):
+    """Align N and power into a tidy DataFrame."""
+    df = pd.DataFrame({"N": list(N), "power": list(predictions)})
+    return df.sort_values("N").reset_index(drop=True)
+
+def plot_power(df: pd.DataFrame, title="Power vs Sample Size"):
+    plt.figure(figsize=(6,4))
+    plt.plot(df["N"], df["power"], marker="o")
+    plt.xlabel("Sample size (N)")
+    plt.ylabel("Power")
+    plt.ylim(0, 1.05)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# --- Example usage ---
+N_vals = [600, 200, 400, 800]  # any order; we’ll sort for plotting
+HR     = 0.78
+pev    = 0.60
+
+out = call_power_model_inputs(POWER_URL, TOKEN, N_vals, HR, pev)
+print(json.dumps(out, indent=2))  # see *all* returned fields
+
+power_df = to_power_df(N_vals, out["predictions"])
+print(power_df)
+
+plot_power(power_df, title=f"Power vs N (HR={HR}, pev={pev})")
