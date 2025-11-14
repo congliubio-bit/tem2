@@ -1,0 +1,306 @@
+# =========================
+# Recruitment-Oriented Rebuild
+# =========================
+from __future__ import annotations
+
+import os, json, math, time, requests
+from typing import Any, Dict, List, Tuple, TypedDict
+import pandas as pd
+from langgraph.graph import StateGraph, END
+
+# ---------------------------------------------------------------------
+# 0) Utilities
+# ---------------------------------------------------------------------
+def _py(v: Any) -> Any:
+    """Ensure JSON-serializable primitives (no numpy scalars / NaN/Inf)."""
+    if hasattr(v, "item"):
+        v = v.item()
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        raise ValueError("NaN/Inf not allowed")
+    if isinstance(v, list):
+        return [_py(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _py(x) for k, x in v.items()}
+    return v
+
+# ---------------------------------------------------------------------
+# 1) Survival + Power adapters (same as before)
+# ---------------------------------------------------------------------
+DATABRICKS_HOST  = os.environ["DATABRICKS_HOST"].rstrip("/")
+DATABRICKS_TOKEN = os.environ["DATABRICKS_TOKEN"]
+
+SURVIVAL_EP = "survival-model-endpoint"
+POWER_EP    = "power-model-endpoint"
+# (Recruitment will be called via your “local” caller below)
+RECRUIT_EP  = "intelhub_dihpos_api"  # informational only
+
+session = requests.Session()
+session.headers.update({
+    "Authorization": f"Bearer {DATABRICKS_TOKEN}",
+    "Content-Type":  "application/json",
+})
+session.trust_env = True
+DEFAULT_CONNECT_TIMEOUT = 5
+DEFAULT_READ_TIMEOUT    = 120
+MAX_RETRIES             = 4
+BACKOFF_BASE_S          = 0.6
+
+def call_endpoint(endpoint: str, payload: Dict[str, Any],
+                  connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+                  read_timeout=DEFAULT_READ_TIMEOUT) -> Dict[str, Any]:
+    url = f"{DATABRICKS_HOST}/serving-endpoints/{endpoint}/invocations"
+    body = json.dumps(payload)
+    for i in range(MAX_RETRIES + 1):
+        try:
+            r = session.post(url, data=body, timeout=(connect_timeout, read_timeout))
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504) and i < MAX_RETRIES:
+                time.sleep(BACKOFF_BASE_S * (2 ** i))
+                continue
+            raise RuntimeError(f"{endpoint} -> {r.status_code}: {r.text[:1000]}")
+        except requests.Timeout:
+            if i < MAX_RETRIES:
+                time.sleep(BACKOFF_BASE_S * (2 ** i))
+                continue
+            raise
+
+def payload_survival(user_params: Dict[str, Any]) -> Dict[str, Any]:
+    # nested dict/list + floats under dataframe_records
+    return {"dataframe_records": [_py(user_params)]}
+
+def parse_survival(resp: Dict[str, Any]) -> Dict[str, Any]:
+    pred = resp["predictions"]
+    surv_df = pd.DataFrame(pred["surv_probs"]).rename(
+        columns={".time": "time", ".pred_survival": "S"}
+    )
+    scalars = {
+        "median_survival_time_quantile": pred.get("median_survival_time_quantile"),
+        "median_survival_time":         pred.get("median_survival_time"),
+        "surv_contr_at_t0":             pred.get("surv_contr_at_t0"),
+        "pev_contr_at_final":           pred.get("pev_contr_at_final"),
+        "HR":                            pred.get("HR"),
+        "total_n_at_90_pos":            pred.get("total_n_at_90_pos"),
+        "comp_time":                    pred.get("comp_time"),
+    }
+    return {"surv_df": surv_df, "surv_scalars": scalars}
+
+def payload_power(N_list: List[int], HR: float, pev: float) -> Dict[str, Any]:
+    # your power endpoint contract: top-level "inputs"
+    return {"inputs": {"N": [int(n) for n in N_list], "HR": float(HR), "pev": float(pev)}}
+
+def parse_power(resp: Dict[str, Any], N_list: List[int]) -> pd.DataFrame:
+    preds = resp["predictions"]
+    df = pd.DataFrame({"N": N_list, "power": preds})
+    return df.sort_values("N")
+
+# ---------------------------------------------------------------------
+# 2) Your local helper: prepare_simulation_data
+#    (Fix OCR typos; if your function name differs, use the adapter.)
+# ---------------------------------------------------------------------
+# If your function is actually named `prepare_simulaition_data` (extra 'i'), adapt here:
+try:
+    # try to import/resolve the correct function if it exists in your namespace
+    prepare_simulation_data  # type: ignore
+except NameError:
+    try:
+        # fallback: map the misspelled version if that's what you have
+        prepare_simulaition_data  # type: ignore
+        prepare_simulation_data = prepare_simulaition_data  # type: ignore
+    except NameError:
+        # If neither exists, raise a clear error
+        raise NameError("You must define/import `prepare_simulation_data(list_of_countries, n_sites_per_country, total_sample_size)` that returns (site_data, country_targets).")
+
+# ---------------------------------------------------------------------
+# 3) Your local recruitment caller (corrected & hardened)
+#    Matches your working local code, fixes OCR issues.
+# ---------------------------------------------------------------------
+def invoke_recruitment_api_local(site_data: pd.DataFrame,
+                                 country_targets: pd.DataFrame,
+                                 *,
+                                 endpoint: str,
+                                 host: str = None,
+                                 token: str = None,
+                                 num_sim: int = 50) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """
+    Calls the Databricks Model Serving API from local, following your working approach:
+      * DataFrames -> JSON (orient='split', index=False)
+      * Replace JSON booleans/nulls with Python-literals so server-side `ast.literal_eval` can parse.
+      * Wrap under top-level "inputs" + optional "params".
+    Returns (projections_df, country_df, raw_json).
+    """
+    host  = (host or DATABRICKS_HOST).rstrip("/")
+    token = token or DATABRICKS_TOKEN
+    if not token:
+        raise ValueError("DATABRICKS_TOKEN is required.")
+
+    url = f"{host}/serving-endpoints/{endpoint}/invocations"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # 1) DataFrames → standard JSON strings (split)
+    site_json_str    = site_data.to_json(orient="split", index=False)
+    country_json_str = country_targets.to_json(orient="split", index=False)
+
+    # 2) Convert JSON booleans/nulls to Python literals for server-side ast.literal_eval
+    def json_to_python_literal(s: str) -> str:
+        return s.replace("null", "None").replace("true", "True").replace("false", "False")
+
+    site_literal    = json_to_python_literal(site_json_str)
+    country_literal = json_to_python_literal(country_json_str)
+
+    # 3) Construct payload that your server expects
+    payload_dict = {
+        "inputs": {
+            "site_data":       site_literal,
+            "country_targets": country_literal
+        },
+        "params": {
+            "num_sim": int(num_sim)
+        }
+    }
+    data_json = json.dumps(payload_dict)
+
+    # 4) POST
+    r = requests.post(url, headers=headers, data=data_json, timeout=120)
+    if r.status_code != 200:
+        # Useful for debugging contract mismatches
+        raise RuntimeError(f"Recruitment {endpoint} -> {r.status_code}: {r.text[:1500]}\nPayload sent: {data_json[:800]}")
+
+    result = r.json()
+
+    # Expecting something like:
+    # result["predictions"]["study"]   -> {"columns":[...], "data":[...]}
+    # result["predictions"]["country"] -> {"columns":[...], "data":[...]}
+    pred = result.get("predictions", {})
+    study   = pred.get("study", {})
+    country = pred.get("country", {})
+
+    projections_df = pd.DataFrame(data=study.get("data", []),   columns=study.get("columns", []))
+    country_df     = pd.DataFrame(data=country.get("data", []), columns=country.get("columns", []))
+    return projections_df, country_df, result
+
+# ---------------------------------------------------------------------
+# 4) LangGraph State and Nodes (conflict-free: return only updated keys)
+# ---------------------------------------------------------------------
+class PipeState(TypedDict, total=False):
+    # user inputs
+    survival_params: Dict[str, Any]
+    recruit_countries: List[str]
+    recruit_n_sites: int
+    power_N: List[int]  # optional
+
+    # survival outputs
+    surv_df: pd.DataFrame
+    surv_scalars: Dict[str, Any]
+
+    # power outputs
+    power_df: pd.DataFrame
+
+    # prepared inputs for recruitment
+    site_data: pd.DataFrame
+    country_targets: pd.DataFrame
+
+    # recruitment outputs
+    recruit_proj_df: pd.DataFrame
+    recruit_country_df: pd.DataFrame
+    recruit_raw: Dict[str, Any]
+
+    # summary
+    summary: Dict[str, Any]
+
+def survival_node(state: PipeState) -> PipeState:
+    resp = call_endpoint(SURVIVAL_EP, payload_survival(state["survival_params"]), read_timeout=180)
+    out  = parse_survival(resp)
+    return out  # ONLY updated keys
+
+def power_node(state: PipeState) -> PipeState:
+    scal = state["surv_scalars"]
+    n_float = scal["total_n_at_90_pos"]
+    HR      = scal["HR"]
+    pev     = scal["pev_contr_at_final"]
+    N_list  = state.get("power_N") or [int(math.ceil(float(n_float)))]
+    resp    = call_endpoint(POWER_EP, payload_power(N_list, HR, pev), read_timeout=60)
+    pdf     = parse_power(resp, N_list)
+    return {"power_df": pdf, "power_N": N_list}
+
+def prepare_node(state: PipeState) -> PipeState:
+    total_sample_size = int(math.ceil(float(state["surv_scalars"]["total_n_at_90_pos"])))
+    site_data, country_targets = prepare_simulation_data(
+        list_of_countries   = state["recruit_countries"],
+        n_sites_per_country = state["recruit_n_sites"],
+        total_sample_size   = total_sample_size
+    )
+    return {"site_data": site_data, "country_targets": country_targets}
+
+def recruit_node(state: PipeState) -> PipeState:
+    proj_df, country_df, raw = invoke_recruitment_api_local(
+        site_data=state["site_data"],
+        country_targets=state["country_targets"],
+        endpoint=RECRUIT_EP,   # uses env HOST/TOKEN
+        num_sim=50
+    )
+    return {"recruit_proj_df": proj_df, "recruit_country_df": country_df, "recruit_raw": raw}
+
+def gather_node(state: PipeState) -> PipeState:
+    s = state["surv_scalars"]
+    summary = {
+        "N_total_90pos": int(math.ceil(float(s["total_n_at_90_pos"]))),
+        "HR":            float(s["HR"]),
+        "pev_final":     float(s["pev_contr_at_final"]),
+        "median_surv":   s.get("median_survival_time"),
+        "power_rows":    len(state.get("power_df", [])),
+        "recruit_rows":  len(state.get("recruit_proj_df", [])),
+    }
+    return {"summary": summary}
+
+def build_graph():
+    g = StateGraph(PipeState)
+    g.add_node("survival", survival_node)
+    g.add_node("power",    power_node)
+    g.add_node("prepare",  prepare_node)
+    g.add_node("recruit",  recruit_node)
+    g.add_node("gather",   gather_node)
+
+    g.set_entry_point("survival")
+    # fan out after survival
+    g.add_edge("survival", "power")
+    g.add_edge("survival", "prepare")
+    # prepare -> recruit
+    g.add_edge("prepare",  "recruit")
+    # join
+    g.add_edge("power",    "gather")
+    g.add_edge("recruit",  "gather")
+    g.add_edge("gather",   END)
+    return g.compile()
+
+# ---------------------------------------------------------------------
+# 5) Demo run (edit params)
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    surv_params = {
+        "marg_probs": {"age": 0.4, "biomarker": 0.5, "time_diag": 0.4},
+        "init_prob": 0.8,
+        "beta": {"age": 0.05, "biomarker": 0.08, "time_diag": 0.06},
+        "intercepts": [-2.64, -9.89],
+        "kappa": [0.44, 0.068],
+        "tau": 8.30,
+        "t0": 1.0,
+        "surv_treat_at_t0": 0.5,
+        "trial_dur": 2.0
+    }
+
+    app = build_graph()
+    final = app.invoke({
+        "survival_params":  surv_params,
+        "recruit_countries": ["United States"],  # or ["us","uk"] if your helper expects short codes
+        "recruit_n_sites":   5,
+        # Optional: "power_N": [500, 600, 700],
+    })
+
+    print("SUMMARY:", json.dumps(final["summary"], indent=2))
+    print("\nSurvival curve head:\n", final["surv_df"].head())
+    print("\nPower head:\n", final["power_df"].head())
+    print("\nPrepared site_data head:\n", final["site_data"].head())
+    print("\nPrepared country_targets head:\n", final["country_targets"].head())
+    print("\nRecruitment projection head:\n", final["recruit_proj_df"].head())
+    print("\nRecruitment country-level head:\n", final["recruit_country_df"].head())
