@@ -1,0 +1,89 @@
+#1
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def plot_recruitment_projection(rdf: pd.DataFrame, *, save_path: str | None = None):
+    """
+    Expects a dataframe with columns like:
+      - day (or time)
+      - enrolled_cum (or cumulative, enrolled, cum_enrolled)
+    We'll try to auto-detect column names if they differ.
+    """
+    # column normalization
+    day_col = None
+    for c in ["day", "time", "t"]:
+        if c in rdf.columns:
+            day_col = c; break
+    if day_col is None:
+        raise ValueError(f"Could not find a time column in {list(rdf.columns)}")
+
+    cum_col = None
+    for c in ["enrolled_cum", "cumulative", "enrolled", "cum_enrolled", "cum"]:
+        if c in rdf.columns:
+            cum_col = c; break
+    if cum_col is None:
+        # if your service returns a different shape, print a head to inspect
+        raise ValueError(f"Could not find a cumulative column in {list(rdf.columns)}")
+
+    # sort & plot
+    rdf = rdf.sort_values(day_col)
+    plt.figure()
+    plt.step(rdf[day_col], rdf[cum_col], where="post")
+    plt.xlabel("Day")
+    plt.ylabel("Cumulative enrolled")
+    plt.title("Recruitment Projection")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
+
+# usage
+plot_recruitment_projection(final["recruit_proj_df"], save_path="recruitment_projection.png")
+
+
+#2
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def plot_survival_curve(sdf: pd.DataFrame, *, save_path: str | None = None):
+    """
+    Expects a dataframe like final['surv_df'] with columns:
+      - time  (x-axis)
+      - S     (survival probability)
+    If your service returns multiple arms, adapt accordingly (e.g., columns "S_control","S_treatment").
+    """
+    # column normalization
+    t_col = "time" if "time" in sdf.columns else "t" if "t" in sdf.columns else None
+    if t_col is None:
+        raise ValueError(f"Could not find a time column in {list(sdf.columns)}")
+
+    # handle single-curve or two-arm curves
+    possible_S_cols = [c for c in ["S", "S_control", "S_treatment"] if c in sdf.columns]
+    if not possible_S_cols:
+        raise ValueError(f"Could not find survival columns (expected 'S' or per-arm columns) in {list(sdf.columns)}")
+
+    plt.figure()
+    if "S" in sdf.columns:
+        sdf = sdf.sort_values(t_col)
+        plt.step(sdf[t_col], sdf["S"], where="post")
+        plt.ylabel("Survival S(t)")
+    else:
+        # plot both arms if present
+        sdf = sdf.sort_values(t_col)
+        if "S_control" in sdf.columns:
+            plt.step(sdf[t_col], sdf["S_control"], where="post", label="Control")
+        if "S_treatment" in sdf.columns:
+            plt.step(sdf[t_col], sdf["S_treatment"], where="post", label="Treatment")
+        plt.legend()
+        plt.ylabel("Survival probability")
+
+    plt.ylim(0, 1.05)
+    plt.xlabel("Time")
+    plt.title("Survival Curve")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
+
+# usage
+plot_survival_curve(final["surv_df"], save_path="survival_curve.png")
