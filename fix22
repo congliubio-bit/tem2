@@ -37,3 +37,24 @@ def gather_node(state: PipeState) -> PipeState:
         "recruit_rows": len(state.get("recruit_df", [])),
     }
     return {"summary": summary}  # ✅
+
+
+###
+def payload_recruit(*, site_data: pd.DataFrame, country_targets: pd.DataFrame) -> dict:
+    # convert DataFrames → list[dict] (JSON-safe)
+    def df_to_records(df: pd.DataFrame):
+        def _py(v): return v.item() if hasattr(v, "item") else v
+        return [{str(k): _py(v) for k, v in row.items()} for _, row in df.iterrows()]
+
+    return {
+        "inputs": {  # <-- REQUIRED WRAPPER
+            "site_data":       df_to_records(site_data),
+            "country_targets": df_to_records(country_targets),
+        }
+    }
+
+
+
+
+
+
