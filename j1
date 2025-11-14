@@ -1,0 +1,349 @@
+# orchestrator.py
+# LangGraph pipeline: Survival (Databricks) → fan-out to Power (Databricks)
+# and prepare_simulaition_data (local) → Recruitment (Databricks) → gather summary.
+# ------------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import os, json, time, math, requests
+from typing import Any, Dict, List, Tuple, TypedDict
+import pandas as pd
+from langgraph.graph import StateGraph, END
+
+# ==============================================================================
+# 0) CONFIG & AUTH
+# ==============================================================================
+
+# Required env vars:
+#   DATABRICKS_HOST  = "https://<workspace-url>"
+#   DATABRICKS_TOKEN = "<personal-access-token>"
+DATABRICKS_HOST  = os.environ["DATABRICKS_HOST"].rstrip("/")
+DATABRICKS_TOKEN = os.environ["DATABRICKS_TOKEN"]
+
+# --- EDIT: your serving endpoint names here ---
+SURVIVAL_EP = "survival-model-endpoint"
+POWER_EP    = "power-model-endpoint"
+RECRUIT_EP  = "recruitment-model-endpoint"
+
+# HTTP session + retry/backoff
+session = requests.Session()
+session.headers.update({
+    "Authorization": f"Bearer {DATABRICKS_TOKEN}",
+    "Content-Type":  "application/json",
+})
+session.trust_env = True  # respects system proxy if needed
+
+DEFAULT_CONNECT_TIMEOUT = 5
+DEFAULT_READ_TIMEOUT    = 120
+MAX_RETRIES             = 4
+BACKOFF_BASE_S          = 0.6
+
+
+def call_endpoint(endpoint: str,
+                  payload: Dict[str, Any],
+                  connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
+                  read_timeout: int = DEFAULT_READ_TIMEOUT) -> Dict[str, Any]:
+    """POST payload to Databricks Serving endpoint with retries/backoff."""
+    url = f"{DATABRICKS_HOST}/serving-endpoints/{endpoint}/invocations"
+    body = json.dumps(payload)
+    for i in range(MAX_RETRIES + 1):
+        try:
+            r = session.post(url, data=body, timeout=(connect_timeout, read_timeout))
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504) and i < MAX_RETRIES:
+                time.sleep(BACKOFF_BASE_S * (2 ** i))
+                continue
+            raise RuntimeError(f"{endpoint} -> {r.status_code}: {r.text[:1000]}")
+        except requests.Timeout:
+            if i < MAX_RETRIES:
+                time.sleep(BACKOFF_BASE_S * (2 ** i))
+                continue
+            raise
+
+
+# ==============================================================================
+# 1) SERIALIZATION HELPERS
+# ==============================================================================
+
+def _py(v: Any) -> Any:
+    """Ensure JSON-serializable primitives (no numpy scalars / NaN / inf)."""
+    if hasattr(v, "item"):
+        v = v.item()
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        raise ValueError("NaN/Inf not allowed in payload")
+    if isinstance(v, list):
+        return [_py(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _py(x) for k, x in v.items()}
+    return v
+
+
+def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Pandas DataFrame → list[dict] with safe primitives."""
+    return [{str(k): _py(val) for k, val in row.items()} for _, row in df.iterrows()]
+
+
+# ==============================================================================
+# 2) ENDPOINT ADAPTERS (payload builders & parsers)
+# ==============================================================================
+
+# --- SURVIVAL (you already validated: dataframe_records with nested dict/list + floats) ---
+
+def payload_survival(user_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    user_params must contain:
+      marg_probs (dict), beta (dict), intercepts (list[float]), kappa (list[float]),
+      init_prob (float), tau (float), t0 (float), surv_treat_at_t0 (float), trial_dur (float)
+    """
+    return {"dataframe_records": [_py(user_params)]}
+
+
+def parse_survival(resp: Dict[str, Any]) -> Dict[str, Any]:
+    pred = resp["predictions"]
+    surv_df = pd.DataFrame(pred["surv_probs"]).rename(
+        columns={".time": "time", ".pred_survival": "S"}
+    )
+    scalars = {
+        "median_survival_time_quantile": pred.get("median_survival_time_quantile"),
+        "median_survival_time":         pred.get("median_survival_time"),
+        "surv_contr_at_t0":             pred.get("surv_contr_at_t0"),
+        "pev_contr_at_final":           pred.get("pev_contr_at_final"),
+        "HR":                            pred.get("HR"),
+        "total_n_at_90_pos":            pred.get("total_n_at_90_pos"),
+        "comp_time":                    pred.get("comp_time"),
+    }
+    return {"surv_df": surv_df, "surv_scalars": scalars}
+
+
+# --- POWER (contract: {"inputs": {"N":[...], "HR": float, "pev": float}}) ---
+
+def payload_power(N_list: List[int], HR: float, pev: float) -> Dict[str, Any]:
+    return {"inputs": {"N": [int(n) for n in N_list], "HR": float(HR), "pev": float(pev)}}
+
+
+def parse_power(resp: Dict[str, Any], N_list: List[int]) -> pd.DataFrame:
+    preds = resp["predictions"]
+    return pd.DataFrame({"N": N_list, "power": preds}).sort_by("N") if hasattr(pd.DataFrame, "sort_by") else pd.DataFrame({"N": N_list, "power": preds}).sort_values("N")
+
+
+# --- RECRUITMENT (your spec: top-level keys 'site_data' & 'country_targets') ---
+# If your serving handler expects a wrapper, switch to: {"inputs": {...}}.
+
+def payload_recruit(*, site_data: pd.DataFrame, country_targets: pd.DataFrame) -> Dict[str, Any]:
+    return {
+        "site_data":       df_to_records(site_data),
+        "country_targets": df_to_records(country_targets),
+    }
+
+
+def parse_recruit(resp: Dict[str, Any]) -> pd.DataFrame:
+    proj = resp.get("projection") or resp.get("recruitment") or []
+    return pd.DataFrame(proj)
+
+
+# ==============================================================================
+# 3) LOCAL HELPER (your function)
+# ==============================================================================
+
+# Ensure this is defined/imported exactly with this signature (note spelling):
+# def prepare_simulaition_data(
+#     list_of_countries: List[str],
+#     n_site_per_country: int,
+#     total_sample_size: int
+# ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+#
+# Example placeholder (remove if you import your real one):
+# def prepare_simulaition_data(list_of_countries, n_site_per_country, total_sample_size):
+#     # return (site_data_df, country_targets_df)
+#     raise NotImplementedError("Import your real prepare_simulaition_data() here.")
+
+
+# ==============================================================================
+# 4) LANGGRAPH STATE & NODES
+# ==============================================================================
+
+class PipeState(TypedDict, total=False):
+    # user inputs
+    survival_params: Dict[str, Any]
+    recruit_countries: List[str]
+    recruit_n_sites: int
+    power_N: List[int]  # optional override
+
+    # survival outputs
+    surv_df: pd.DataFrame
+    surv_scalars: Dict[str, Any]
+
+    # power outputs
+    power_df: pd.DataFrame
+
+    # prepared inputs for recruitment
+    site_data: pd.DataFrame
+    country_targets: pd.DataFrame
+
+    # recruitment outputs
+    recruit_df: pd.DataFrame
+
+    # summary
+    summary: Dict[str, Any]
+
+
+def survival_node(state: PipeState) -> PipeState:
+    resp = call_endpoint(
+        SURVIVAL_EP,
+        payload_survival(state["survival_params"]),
+        read_timeout=180
+    )
+    out = parse_survival(resp)
+    return {**state, **out}
+
+
+def power_node(state: PipeState) -> PipeState:
+    scal = state["surv_scalars"]
+    n_float = scal["total_n_at_90_pos"]
+    HR      = scal["HR"]
+    pev     = scal["pev_contr_at_final"]
+
+    # If user didn’t pass power_N, use ceil(total_n_at_90_pos)
+    N_list = state.get("power_N") or [int(math.ceil(float(n_float)))]
+
+    resp = call_endpoint(POWER_EP, payload_power(N_list, HR, pev), read_timeout=60)
+    pdf  = parse_power(resp, N_list)
+    return {**state, "power_df": pdf, "power_N": N_list}
+
+
+def prepare_node(state: PipeState) -> PipeState:
+    total_sample_size = int(math.ceil(float(state["surv_scalars"]["total_n_at_90_pos"])))
+    # call your local helper (import/define before this):
+    site_data, country_targets = prepare_simulaition_data(
+        list_of_countries  = state["recruit_countries"],
+        n_site_per_country = state["recruit_n_sites"],
+        total_sample_size  = total_sample_size
+    )
+    return {**state, "site_data": site_data, "country_targets": country_targets}
+
+
+def recruit_node(state: PipeState) -> PipeState:
+    body = payload_recruit(site_data=state["site_data"], country_targets=state["country_targets"])
+    resp = call_endpoint(RECRUIT_EP, body, read_timeout=60)
+    rdf  = parse_recruit(resp)
+    return {**state, "recruit_df": rdf}
+
+
+def gather_node(state: PipeState) -> PipeState:
+    s = state["surv_scalars"]
+    summary = {
+        "N_total_90pos": int(math.ceil(float(s["total_n_at_90_pos"]))),
+        "HR":            float(s["HR"]),
+        "pev_final":     float(s["pev_contr_at_final"]),
+        "median_surv":   s.get("median_survival_time"),
+        "power_rows":    int(len(state.get("power_df", []))),
+        "recruit_rows":  int(len(state.get("recruit_df", []))),
+    }
+    return {**state, "summary": summary}
+
+
+def build_graph():
+    g = StateGraph(PipeState)
+    g.add_node("survival", survival_node)
+    g.add_node("power",    power_node)
+    g.add_node("prepare",  prepare_node)
+    g.add_node("recruit",  recruit_node)
+    g.add_node("gather",   gather_node)
+
+    g.set_entry_point("survival")
+    # fan-out
+    g.add_edge("survival", "power")
+    g.add_edge("survival", "prepare")
+    # prepare → recruit
+    g.add_edge("prepare",  "recruit")
+    # join
+    g.add_edge("power",    "gather")
+    g.add_edge("recruit",  "gather")
+    g.add_edge("gather",   END)
+    return g.compile()
+
+
+# ==============================================================================
+# 5) DEMO (optional)
+# ==============================================================================
+
+if __name__ == "__main__":
+    # Example survival inputs — EDIT to your scenario
+    surv_params = {
+        "marg_probs": {"age": 0.4, "biomarker": 0.5, "time_diag": 0.4},
+        "init_prob": 0.8,
+        "beta": {"age": 0.05, "biomarker": 0.08, "time_diag": 0.06},
+        "intercepts": [-2.64, -9.89],
+        "kappa": [0.44, 0.068],
+        "tau": 8.30,
+        "t0": 1.0,
+        "surv_treat_at_t0": 0.5,
+        "trial_dur": 2.0,
+    }
+
+    # Example local inputs for recruitment helper
+    countries = ["us", "uk"]
+    n_sites   = 5
+
+    app = build_graph()
+    final = app.invoke({
+        "survival_params":  surv_params,
+        "recruit_countries": countries,
+        "recruit_n_sites":   n_sites,
+        # Optional: override power Ns
+        # "power_N": [500, 600, 700],
+    })
+
+    print("SUMMARY:", json.dumps(final["summary"], indent=2))
+
+    # Quick peeks (guard for optional keys)
+    if "surv_df" in final:
+        print("\nSurvival curve (head):")
+        print(final["surv_df"].head())
+
+    if "power_df" in final:
+        print("\nPower table (head):")
+        print(final["power_df"].head())
+
+    if "site_data" in final:
+        print("\nPrepared site_data (head):")
+        print(final["site_data"].head())
+
+    if "country_targets" in final:
+        print("\nPrepared country_targets (head):")
+        print(final["country_targets"].head())
+
+    if "recruit_df" in final:
+        print("\nRecruitment projection (head):")
+        print(final["recruit_df"].head())
+
+    # Optional quick plots (if running in a notebook / has matplotlib)
+    try:
+        import matplotlib.pyplot as plt
+
+        if "surv_df" in final:
+            plt.figure()
+            sdf = final["surv_df"]
+            plt.step(sdf["time"], sdf["S"], where="post")
+            plt.ylim(0, 1.05)
+            plt.xlabel("Time (years)"); plt.ylabel("Survival S(t)")
+            plt.title("Survival (Serving)"); plt.tight_layout(); plt.show()
+
+        if "power_df" in final and len(final["power_df"]) > 1:
+            plt.figure()
+            pdf = final["power_df"].sort_values("N")
+            plt.plot(pdf["N"], pdf["power"], marker="o")
+            plt.ylim(0, 1.05)
+            plt.xlabel("Sample size (N)"); plt.ylabel("Power")
+            plt.title("Power vs N"); plt.grid(True, ls="--", alpha=0.5)
+            plt.tight_layout(); plt.show()
+
+        if "recruit_df" in final and {"day","enrolled_cum"}.issubset(final["recruit_df"].columns):
+            plt.figure()
+            rdf = final["recruit_df"]
+            plt.step(rdf["day"], rdf["enrolled_cum"], where="post")
+            plt.xlabel("Day"); plt.ylabel("Cumulative enrolled")
+            plt.title("Recruitment Projection"); plt.tight_layout(); plt.show()
+    except Exception as _e:
+        pass
