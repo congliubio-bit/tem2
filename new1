@@ -1,3 +1,84 @@
+# state_audit.py
+from __future__ import annotations
+import time, json, sqlite3, contextlib
+from typing import Any, Dict, Iterable, Optional
+
+# ---------- 1) Append-only event log (SQLite backed) ----------
+DDL = """
+CREATE TABLE IF NOT EXISTS state_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  ts REAL NOT NULL,                -- wall clock seconds (time.time())
+  node TEXT NOT NULL,              -- node name that wrote the keys
+  key TEXT NOT NULL,               -- state key written by node
+  value_json TEXT NOT NULL         -- JSON-serialized value (subset)
+);
+CREATE INDEX IF NOT EXISTS idx_events_thread_time ON state_events(thread_id, ts);
+CREATE INDEX IF NOT EXISTS idx_events_thread_node ON state_events(thread_id, node);
+"""
+
+def open_events_db(path: str = "state_events.sqlite"):
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.executescript(DDL)
+    return con
+
+def _json(v: Any) -> str:
+    class _Enc(json.JSONEncoder):
+        def default(self, o):
+            # best-effort: pandas/numpy friendly-ish
+            try:
+                import pandas as pd
+                if isinstance(o, pd.DataFrame):
+                    return {"__df__": True, "records": o.to_dict(orient="records")}
+                if isinstance(o, pd.Series):
+                    return {"__series__": True, "records": o.to_dict()}
+            except Exception:
+                pass
+            return super().default(o)
+    return json.dumps(v, cls=_Enc)
+
+def log_updates(con: sqlite3.Connection, thread_id: str, updates: Dict[str, Any], ts: Optional[float]=None):
+    """Write one row per (key,value) written by the node that produced `updates`."""
+    ts = ts or time.time()
+    # updates looks like: {"node_name": {"key1": val1, "key2": val2}}
+    with con:
+        for node, writes in updates.items():
+            for k, v in writes.items():
+                con.execute(
+                    "INSERT INTO state_events(thread_id, ts, node, key, value_json) VALUES (?,?,?,?,?)",
+                    (thread_id, ts, node, k, _json(v))
+                )
+
+# ---------- 2) Query helpers ----------
+def read_timeline(con: sqlite3.Connection, thread_id: str, node: Optional[str]=None) -> Iterable[dict]:
+    q = "SELECT ts,node,key,value_json FROM state_events WHERE thread_id=?"
+    args = [thread_id]
+    if node:
+        q += " AND node=?"
+        args.append(node)
+    q += " ORDER BY ts ASC, id ASC"
+    for ts, node, key, value_json in con.execute(q, args):
+        yield {"ts": ts, "node": node, "key": key, "value": json.loads(value_json)}
+
+def reconstruct_state(con: sqlite3.Connection, thread_id: str, up_to_ts: Optional[float]=None) -> Dict[str, Any]:
+    """Replay events to rebuild merged state at a time cutoff."""
+    q = "SELECT ts,node,key,value_json FROM state_events WHERE thread_id=?"
+    args = [thread_id]
+    if up_to_ts is not None:
+        q += " AND ts<=?"
+        args.append(up_to_ts)
+    q += " ORDER BY ts ASC, id ASC"
+    state: Dict[str, Any] = {}
+    for ts, node, key, value_json in con.execute(q, args):
+        state[key] = json.loads(value_json)
+    return state
+
+
+
+###########################
+
+
 # in your notebook / main script
 from langgraph.checkpoint.sqlite import SqliteSaver
 from state_audit import open_events_db, log_updates, read_timeline, reconstruct_state
@@ -30,3 +111,25 @@ for update in app.stream(
 
 # 4) Final state if you also want it (one-shot invoke)
 final = app.invoke(initial_state, config={"configurable": {"thread_id": thread_id}})
+
+
+
+
+####
+
+for evt in read_timeline(events_con, thread_id, node="survival"):
+    print(evt["ts"], evt["node"], evt["key"], type(evt["value"]))
+
+
+###
+cutoff = 1.0e12  # put your UNIX epoch cutoff here
+state_as_of = reconstruct_state(events_con, thread_id, up_to_ts=cutoff)
+# e.g., state_as_of["surv_scalars"], state_as_of["site_data"], etc.
+
+
+##
+# enumerate checkpoints for this run (API may evolve; adjust if needed)
+# Each checkpoint contains merged state for that step — good for “state after node X”
+# Example pseudo-usage:
+# for cp in saver.list(thread_id=thread_id):
+#     print(cp.ts, cp.node, cp.v)   # inspect cp.state or cp.writes
