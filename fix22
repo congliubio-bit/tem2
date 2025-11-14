@@ -1,0 +1,39 @@
+def survival_node(state: PipeState) -> PipeState:
+    resp = call_endpoint(SURVIVAL_EP, payload_survival(state["survival_params"]), read_timeout=180)
+    out  = parse_survival(resp)     # -> {"surv_df": ..., "surv_scalars": {...}}
+    return out                      # ✅ ONLY the new/updated keys
+
+def power_node(state: PipeState) -> PipeState:
+    scal = state["surv_scalars"]
+    n_float = scal["total_n_at_90_pos"]; HR = scal["HR"]; pev = scal["pev_contr_at_final"]
+    N_list = state.get("power_N") or [int(math.ceil(float(n_float)))]
+    resp = call_endpoint(POWER_EP, payload_power(N_list, HR, pev), read_timeout=60)
+    pdf  = parse_power(resp, N_list)
+    return {"power_df": pdf, "power_N": N_list}   # ✅ only new keys
+
+def prepare_node(state: PipeState) -> PipeState:
+    total_sample_size = int(math.ceil(float(state["surv_scalars"]["total_n_at_90_pos"])))
+    site_data, country_targets = prepare_simulaition_data(
+        list_of_countries  = state["recruit_countries"],
+        n_site_per_country = state["recruit_n_sites"],
+        total_sample_size  = total_sample_size
+    )
+    return {"site_data": site_data, "country_targets": country_targets}  # ✅
+
+def recruit_node(state: PipeState) -> PipeState:
+    body = payload_recruit(site_data=state["site_data"], country_targets=state["country_targets"])
+    resp = call_endpoint(RECRUIT_EP, body, read_timeout=60)
+    rdf  = parse_recruit(resp)
+    return {"recruit_df": rdf}  # ✅
+
+def gather_node(state: PipeState) -> PipeState:
+    s = state["surv_scalars"]
+    summary = {
+        "N_total_90pos": int(math.ceil(float(s["total_n_at_90_pos"]))),
+        "HR": float(s["HR"]),
+        "pev_final": float(s["pev_contr_at_final"]),
+        "median_surv": s.get("median_survival_time"),
+        "power_rows": len(state.get("power_df", [])),
+        "recruit_rows": len(state.get("recruit_df", [])),
+    }
+    return {"summary": summary}  # ✅
