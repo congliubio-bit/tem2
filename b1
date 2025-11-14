@@ -1,0 +1,79 @@
+#1
+from typing import Any, Dict, List, TypedDict
+import pandas as pd
+
+class PipeState(TypedDict, total=False):
+    # user inputs
+    survival_params: Dict[str, Any]
+    recruit_countries: List[str]
+    recruit_n_sites: int
+
+    # survival outputs
+    surv_df: pd.DataFrame
+    surv_scalars: Dict[str, Any]
+
+    # power outputs
+    power_N: List[int]
+    power_df: pd.DataFrame
+
+    # recruitment inputs/outputs
+    recruit_sites_df: pd.DataFrame
+    recruit_targets_df: pd.DataFrame
+    recruit_df: pd.DataFrame
+
+    # final summary
+    summary: Dict[str, Any]
+
+#2
+import math
+
+def _to_py(x):
+    # ensure JSON-serializable primitives
+    if hasattr(x, "item"): return x.item()
+    return x
+
+def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    return [{str(k): _to_py(v) for k, v in row.items()} for _, row in df.iterrows()]
+
+#3
+def payload_recruit_two_dfs(sites_df: pd.DataFrame, targets_df: pd.DataFrame) -> Dict[str, Any]:
+    sites_rec   = df_to_records(sites_df)
+    targets_rec = df_to_records(targets_df)
+    return {"inputs": {"sites": sites_rec, "targets": targets_rec}}
+
+def parse_recruit(resp: Dict[str, Any]) -> pd.DataFrame:
+    # adjust the key if your service returns a different name
+    proj = resp.get("projection") or resp.get("recruitment") or []
+    return pd.DataFrame(proj)
+
+#4
+# import your helper
+# from your_module import prepare_simulation_data
+
+def recruit_node(state: PipeState) -> PipeState:
+    # 1) derive total sample from survival scalars
+    n_total = int(math.ceil(float(state["surv_scalars"]["total_n_at_90_pos"])))
+    countries = state["recruit_countries"]
+    n_sites   = state["recruit_n_sites"]
+
+    # 2) build the two input tables
+    sites_df, targets_df = prepare_simulation_data(
+        countries=countries,
+        number_site=n_sites,
+        total_sample=n_total
+    )
+
+    # 3) call the serving endpoint with both tables
+    resp = call_endpoint(
+        RECRUIT_EP,
+        payload_recruit_two_dfs(sites_df, targets_df),
+        read_timeout=60
+    )
+    rdf = parse_recruit(resp)
+
+    return {
+        **state,
+        "recruit_sites_df": sites_df,
+        "recruit_targets_df": targets_df,
+        "recruit_df": rdf
+    }
