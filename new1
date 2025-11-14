@@ -1,0 +1,32 @@
+# in your notebook / main script
+from langgraph.checkpoint.sqlite import SqliteSaver
+from state_audit import open_events_db, log_updates, read_timeline, reconstruct_state
+import time
+
+# 1) Build app WITH a checkpointer (snapshots per node)
+saver = SqliteSaver.from_conn_string("checkpoints.sqlite")
+app   = build_graph().with_config(checkpointer=saver)
+
+# 2) Prepare an events DB for fine-grained history
+events_con = open_events_db("state_events.sqlite")
+
+# 3) Run with streaming updates; persist (thread_id lets you group the run)
+thread_id = "demo-001"  # set however you like (uuid ok)
+initial_state = {
+    "survival_params":  surv_params,
+    "recruit_countries": ["us","uk"],
+    "recruit_n_sites":  5,
+    # optional: "power_N": [500, 600, 700]
+}
+
+for update in app.stream(
+    initial_state,
+    stream_mode="updates",
+    config={"configurable": {"thread_id": thread_id}},
+):
+    # update example: {"survival": {"surv_df": ..., "surv_scalars": {...}}}
+    ts = time.time()
+    log_updates(events_con, thread_id, update, ts=ts)
+
+# 4) Final state if you also want it (one-shot invoke)
+final = app.invoke(initial_state, config={"configurable": {"thread_id": thread_id}})
