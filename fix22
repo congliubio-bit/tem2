@@ -53,8 +53,35 @@ def payload_recruit(*, site_data: pd.DataFrame, country_targets: pd.DataFrame) -
         }
     }
 
+####3
 
+import sqlite3, json, pandas as pd
 
+con = sqlite3.connect("state_events.sqlite")
+df = pd.read_sql("SELECT * FROM state_events ORDER BY ts, id;", con)
+con.close()
 
+def decode_value(s: str):
+    # Parse JSON string → Python object
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return s  # leave as-is if it wasn't valid JSON
+    # Rehydrate DataFrame/Series if we logged with markers
+    if isinstance(obj, dict):
+        # accept both "__df__" and "_df_" in case of OCR/old logs
+        if obj.get("__df__") is True or obj.get("_df_") is True:
+            recs = obj.get("records", [])
+            return pd.DataFrame(recs)
+        if obj.get("__series__") is True:
+            return pd.Series(obj.get("records", {}))
+    return obj
+
+df["value_obj"] = df["value_json"].apply(decode_value)
+
+# Nice display:
+pd.set_option("display.max_colwidth", None)
+pd.set_option("display.width", 200)
+display(df[["id","thread_id","ts","node","key","value_obj"]])
 
 
